@@ -1,4 +1,4 @@
-# app.py (Evaluator + Admin)
+# app.py (Evaluator + Admin with simple password auth)
 import streamlit as st
 import sqlite3, json, io, csv, inspect, datetime, time
 from omr import (
@@ -140,6 +140,48 @@ def annotate_overlay_with_scores(warped, scores, show_correct=False, debug=False
 
     return overlay
 
+# ---------------- AUTH HELPERS ----------------
+def is_admin_authenticated():
+    """Return True if session is already authenticated as admin."""
+    return st.session_state.get("admin_authenticated", False)
+
+def admin_login_widget():
+    """Render login widget & set session state on success."""
+    if "admin_authenticated" not in st.session_state:
+        st.session_state.admin_authenticated = False
+
+    # If secrets not set, show instructions
+    try:
+        admin_pw = st.secrets["auth"]["admin_password"]
+    except Exception:
+        st.warning("Admin password not configured. On Streamlit Cloud, set `auth.admin_password` in Secrets (App → Settings → Secrets).")
+        admin_pw = None
+
+    if is_admin_authenticated():
+        cols = st.columns([1, 8])
+        with cols[0]:
+            if st.button("🔒 Logout (Admin)"):
+                st.session_state.admin_authenticated = False
+                st.success("Logged out.")
+                st.experimental_rerun()
+        with cols[1]:
+            st.info("You are authenticated as Admin.")
+        return True
+
+    pw = st.text_input("🔑 Admin password", type="password")
+    if st.button("Login as Admin"):
+        if admin_pw is None:
+            st.error("Admin password not configured in secrets.")
+            return False
+        if pw == admin_pw:
+            st.session_state.admin_authenticated = True
+            st.success("Admin login successful.")
+            return True
+        else:
+            st.error("Wrong password.")
+            return False
+    return False
+
 # ---------------- STREAMLIT UI ----------------
 st.set_page_config(page_title="OMR — Evaluator & Admin", layout="wide")
 st.title("OMR — Evaluator & Admin Dashboard")
@@ -170,6 +212,13 @@ if mode_top == "Evaluator":
 # ---------------- Admin Mode ----------------
 if mode_top == "Admin":
     st.header("🔑 Admin — Manage Answer Keys")
+    # login widget
+    if not is_admin_authenticated():
+        with st.expander("Admin login"):
+            admin_login_widget()
+        st.stop()
+
+    # authenticated admin flow
     ensure_tables()
 
     with st.expander("Upload new answer key"):
@@ -183,7 +232,13 @@ if mode_top == "Admin":
                 st.warning("Upload a CSV file.")
             else:
                 try:
-                    text = uploaded_key.getvalue().decode("utf-8")
+                    # UploadedFile may have getvalue() or read(); handle both
+                    raw = None
+                    if hasattr(uploaded_key, "getvalue"):
+                        raw = uploaded_key.getvalue()
+                    else:
+                        raw = uploaded_key.read()
+                    text = raw.decode("utf-8")
                     reader = csv.reader(io.StringIO(text))
                     answers = {}
                     for row in reader:
@@ -194,8 +249,11 @@ if mode_top == "Admin":
                             continue
                         a = str(row[1]).strip()
                         answers[q] = a
-                    insert_key_into_db(exam_id, set_name, answers)
-                    st.success(f"Uploaded key: {exam_id} / {set_name}")
+                    if answers:
+                        insert_key_into_db(exam_id, set_name, answers)
+                        st.success(f"Uploaded key: {exam_id} / {set_name}")
+                    else:
+                        st.warning("No valid rows parsed from CSV.")
                 except Exception as e:
                     st.error(f"Error parsing/saving key: {e}")
 
@@ -215,8 +273,11 @@ if mode_top == "Admin":
                             st.write(f"**{sel_exam} — {set_name}**  — {len(answers_json)} items")
                             cols = st.columns([1,1,1,4])
                             if cols[0].button("View", key=f"view_{sel_exam}_{set_name}"):
-                                # show small table
-                                rows = sorted([(int(k) if k.isdigit() else k, v) for k,v in answers_json.items()])
+                                # show small table (first 200 rows)
+                                rows = sorted(
+                                    [(int(k) if str(k).isdigit() else k, v) for k,v in answers_json.items()],
+                                    key=lambda x: (x[0] if isinstance(x[0], int) else float("inf"))
+                                )
                                 preview = "\n".join([f"{k},{v}" for k,v in rows[:200]])
                                 st.text(preview)
                             if cols[1].button("Download CSV", key=f"dl_{sel_exam}_{set_name}"):
@@ -366,7 +427,7 @@ if uploaded_files:
         annotated = annotate_overlay_with_scores(warped, scores, show_correct=show_correct, debug=debug_mode, offset_x=off_x, offset_y=off_y)
         buf = io.BytesIO()
         annotated.save(buf, format="PNG")
-        # fixed param name
+        # fixed param name that matches older Streamlit versions used in logs
         st.image(buf.getvalue(), caption=f"Detected Marks for {display_name}", use_column_width=True)
 
     # Export all results into one CSV
@@ -375,7 +436,15 @@ if uploaded_files:
         w = csv.writer(output)
         w.writerow(["file","question","chosen","correct","confidence","is_correct","ambiguous"])
         for fname, scores in all_scores:
-            for q, d in sorted(scores.get("details", {}).items(), key=lambda x:int(x[0]) if str(x[0]).isdigit() else x[0]):
+            details = scores.get("details", {})
+            # safe sort: numeric keys first
+            def sort_key(x):
+                k = x[0]
+                try:
+                    return (0, int(k))
+                except Exception:
+                    return (1, str(k))
+            for q, d in sorted(details.items(), key=sort_key):
                 w.writerow([
                     fname,
                     q,
