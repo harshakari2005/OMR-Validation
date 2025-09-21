@@ -1,6 +1,6 @@
-# app.py (continuous camera capture + upload) - modified to avoid use_container_width
+# app.py (Evaluator + Admin)
 import streamlit as st
-import sqlite3, json, io, csv, inspect
+import sqlite3, json, io, csv, inspect, datetime, time
 from omr import (
     load_image_bytes,
     warp_document,
@@ -10,12 +10,11 @@ from omr import (
 from utils import is_blurry, brightness_score, estimate_skew_angle
 import numpy as np, cv2
 from PIL import Image, ImageDraw, ImageFont
-import time
 
 DB_PATH = "omr_system.db"
 
 # ---------------- DB HELPERS ----------------
-def get_exam_ids_from_db():
+def ensure_tables():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -27,12 +26,20 @@ def get_exam_ids_from_db():
             uploaded_on TEXT
         )
     """)
+    conn.commit()
+    conn.close()
+
+def get_exam_ids_from_db():
+    ensure_tables()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
     cur.execute("SELECT DISTINCT exam_id FROM answer_keys")
     rows = [r[0] for r in cur.fetchall()]
     conn.close()
     return rows
 
 def load_keys_from_db(exam_id):
+    ensure_tables()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT set_name, answers_json FROM answer_keys WHERE exam_id=?", (exam_id,))
@@ -40,7 +47,26 @@ def load_keys_from_db(exam_id):
     conn.close()
     return {set_name: json.loads(ans_json) for set_name, ans_json in rows}
 
-# ---------------- OVERLAY ANNOTATOR (unchanged) ----------------
+def insert_key_into_db(exam_id, set_name, answers_dict):
+    ensure_tables()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO answer_keys (exam_id, set_name, answers_json, uploaded_on) VALUES (?,?,?,?)",
+        (exam_id, set_name, json.dumps(answers_dict), datetime.datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+def delete_key_from_db(exam_id, set_name):
+    ensure_tables()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM answer_keys WHERE exam_id=? AND set_name=?", (exam_id, set_name))
+    conn.commit()
+    conn.close()
+
+# ---------------- OVERLAY ANNOTATOR (unchanged, returns PIL Image) ----------------
 def annotate_overlay_with_scores(warped, scores, show_correct=False, debug=False, offset_x=-30, offset_y=0):
     overlay = Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(overlay)
@@ -115,32 +141,100 @@ def annotate_overlay_with_scores(warped, scores, show_correct=False, debug=False
     return overlay
 
 # ---------------- STREAMLIT UI ----------------
-st.set_page_config(page_title="Evaluator Dashboard", layout="wide")
-st.title("Evaluator Dashboard — OMR Evaluation")
+st.set_page_config(page_title="OMR — Evaluator & Admin", layout="wide")
+st.title("OMR — Evaluator & Admin Dashboard")
 
-# Sidebar tuning controls
-st.sidebar.header("Settings / Detection tuning")
-blur_thresh = st.sidebar.slider('Blur threshold', 10, 300, 100)
-brightness_low = st.sidebar.slider('Min brightness', 30, 220, 70)
-conf_threshold = st.sidebar.slider('Confidence threshold', 1, 100, 25) / 100.0
-fill_thresh = st.sidebar.slider('Fill threshold', 0.05, 0.40, 0.18, step=0.01)
-ambig_low = st.sidebar.slider('Ambiguous lower bound', 0.01, 0.30, 0.08, step=0.01)
-adaptive_bs = st.sidebar.slider('Adaptive blocksize', 11, 51, 25, step=2)
-adaptive_C = st.sidebar.slider('Adaptive C', -10, 20, 10)
-min_radius_ratio = st.sidebar.slider('Min radius ratio', 0.004, 0.02, 0.009, step=0.001)
-max_radius_ratio = st.sidebar.slider('Max radius ratio', 0.02, 0.06, 0.035, step=0.001)
-search_radius = st.sidebar.slider('Search radius (px)', 8, 48, 18)
-morph_iter = st.sidebar.slider('Morph iterations', 0, 4, 2)
-cc_area_thresh = st.sidebar.slider('Connected-component area thresh', 0.02, 0.5, 0.12, step=0.01)
-off_x = st.sidebar.slider("Marker horizontal offset (per-block)", -60, 60, -30, step=1)
-off_y = st.sidebar.slider("Marker vertical offset (px)", -80, 120, 0, step=1)
-show_correct = st.sidebar.checkbox("Outline chosen bubble (green=correct/red=wrong/orange=ambiguous)", value=False)
-debug_mode = st.sidebar.checkbox("Detect debug mode (draw debug info)", value=False)
+# top-level mode selector
+mode_top = st.sidebar.radio("App Mode", ["Evaluator", "Admin"])
 
+# Common sliders for evaluator placed in sidebar (only used in Evaluator mode)
+if mode_top == "Evaluator":
+    st.sidebar.header("Detection tuning")
+    blur_thresh = st.sidebar.slider('Blur threshold', 10, 300, 100)
+    brightness_low = st.sidebar.slider('Min brightness', 30, 220, 70)
+    conf_threshold = st.sidebar.slider('Confidence threshold', 1, 100, 25) / 100.0
+    fill_thresh = st.sidebar.slider('Fill threshold', 0.05, 0.40, 0.18, step=0.01)
+    ambig_low = st.sidebar.slider('Ambiguous lower bound', 0.01, 0.30, 0.08, step=0.01)
+    adaptive_bs = st.sidebar.slider('Adaptive blocksize', 11, 51, 25, step=2)
+    adaptive_C = st.sidebar.slider('Adaptive C', -10, 20, 10)
+    min_radius_ratio = st.sidebar.slider('Min radius ratio', 0.004, 0.02, 0.009, step=0.001)
+    max_radius_ratio = st.sidebar.slider('Max radius ratio', 0.02, 0.06, 0.035, step=0.001)
+    search_radius = st.sidebar.slider('Search radius (px)', 8, 48, 18)
+    morph_iter = st.sidebar.slider('Morph iterations', 0, 4, 2)
+    cc_area_thresh = st.sidebar.slider('Connected-component area thresh', 0.02, 0.5, 0.12, step=0.01)
+    off_x = st.sidebar.slider("Marker horizontal offset (per-block)", -60, 60, -30, step=1)
+    off_y = st.sidebar.slider("Marker vertical offset (px)", -80, 120, 0, step=1)
+    show_correct = st.sidebar.checkbox("Outline chosen bubble (green=correct/red=wrong/orange=ambiguous)", value=False)
+    debug_mode = st.sidebar.checkbox("Detect debug mode (draw debug info)", value=False)
+
+# ---------------- Admin Mode ----------------
+if mode_top == "Admin":
+    st.header("🔑 Admin — Manage Answer Keys")
+    ensure_tables()
+
+    with st.expander("Upload new answer key"):
+        exam_id = st.text_input("Exam ID (e.g., Week1, Test2025)", key="adm_exam")
+        set_name = st.text_input("Set Name (e.g., SetA, SetB)", key="adm_set")
+        uploaded_key = st.file_uploader("Upload Answer Key (CSV: question,choice) — two columns", type=["csv"], key="adm_up")
+        if st.button("Save Answer Key"):
+            if not exam_id or not set_name:
+                st.warning("Please provide Exam ID and Set Name.")
+            elif uploaded_key is None:
+                st.warning("Upload a CSV file.")
+            else:
+                try:
+                    text = uploaded_key.getvalue().decode("utf-8")
+                    reader = csv.reader(io.StringIO(text))
+                    answers = {}
+                    for row in reader:
+                        if not row: continue
+                        q = str(row[0]).strip()
+                        if len(row) < 2:
+                            st.warning(f"Skipping row {row} — missing answer column.")
+                            continue
+                        a = str(row[1]).strip()
+                        answers[q] = a
+                    insert_key_into_db(exam_id, set_name, answers)
+                    st.success(f"Uploaded key: {exam_id} / {set_name}")
+                except Exception as e:
+                    st.error(f"Error parsing/saving key: {e}")
+
+    with st.expander("Existing keys"):
+        exam_ids = get_exam_ids_from_db()
+        if not exam_ids:
+            st.info("No keys found yet.")
+        else:
+            sel_exam = st.selectbox("Select exam to view sets", ["-- select --"] + exam_ids)
+            if sel_exam and sel_exam != "-- select --":
+                keys = load_keys_from_db(sel_exam)
+                if not keys:
+                    st.info("No sets for this exam.")
+                else:
+                    for set_name, answers_json in keys.items():
+                        with st.container():
+                            st.write(f"**{sel_exam} — {set_name}**  — {len(answers_json)} items")
+                            cols = st.columns([1,1,1,4])
+                            if cols[0].button("View", key=f"view_{sel_exam}_{set_name}"):
+                                # show small table
+                                rows = sorted([(int(k) if k.isdigit() else k, v) for k,v in answers_json.items()])
+                                preview = "\n".join([f"{k},{v}" for k,v in rows[:200]])
+                                st.text(preview)
+                            if cols[1].button("Download CSV", key=f"dl_{sel_exam}_{set_name}"):
+                                csv_text = "question,answer\n" + "\n".join([f"{q},{a}" for q,a in answers_json.items()])
+                                st.download_button(f"Download {sel_exam}_{set_name}.csv", data=csv_text.encode("utf-8"),
+                                                   file_name=f"{sel_exam}_{set_name}.csv", mime="text/csv")
+                            if cols[2].button("Delete", key=f"del_{sel_exam}_{set_name}"):
+                                delete_key_from_db(sel_exam, set_name)
+                                st.success("Deleted. Refreshing...")
+                                st.experimental_rerun()
+
+    st.stop()  # don't run evaluator UI when in admin mode
+
+# ---------------- Evaluator Mode (default flow below) ----------------
 # Load exam ids
 exam_ids = get_exam_ids_from_db()
 if not exam_ids:
-    st.warning("⚠️ No answer keys found in the database. Please upload keys in the Admin Dashboard first.")
+    st.warning("⚠️ No answer keys found in the database. Please upload keys in the Admin dashboard first.")
     st.stop()
 
 exam_id = st.selectbox("Select Exam/Week", exam_ids)
@@ -152,17 +246,17 @@ set_choice = st.selectbox("Select Set", options=list(keys.keys()))
 key = keys[set_choice]
 
 # ---------------- Upload or Camera option ----------------
-mode = st.radio("Choose Input Mode", ["📂 Upload from files", "📸 Continuous camera capture"])
+input_mode = st.radio("Choose Input Mode", ["📂 Upload from files", "📸 Continuous camera capture"])
 
 # storage for camera captures across reruns
 if "camera_batch" not in st.session_state:
-    st.session_state.camera_batch = []  # list of dicts {name, bytes}
+    st.session_state.camera_batch = []
 
 uploaded_files = []
-if mode == "📂 Upload from files":
+if input_mode == "📂 Upload from files":
     uploaded_files = st.file_uploader("Upload OMR sheets (multiple allowed)", type=["png","jpg","jpeg"], accept_multiple_files=True)
 
-elif mode == "📸 Continuous camera capture":
+elif input_mode == "📸 Continuous camera capture":
     st.markdown("**Camera capture mode** — take one photo at a time and click **Add capture** to append to the batch.")
     cam_photo = st.camera_input("Take a photo of the OMR sheet")
     col1, col2, col3 = st.columns([1,1,1])
@@ -171,7 +265,6 @@ elif mode == "📸 Continuous camera capture":
             if cam_photo is None:
                 st.warning("No camera photo to add. Take a photo first.")
             else:
-                # read bytes and store with timestamp name
                 b = cam_photo.read()
                 name = f"camera_{len(st.session_state.camera_batch)+1}_{int(time.time())}.jpg"
                 st.session_state.camera_batch.append({"name": name, "bytes": b})
@@ -182,10 +275,8 @@ elif mode == "📸 Continuous camera capture":
             st.info("Cleared camera batch.")
     with col3:
         if st.button("Process all captures now"):
-            # we'll just fall through to processing code below; set uploaded_files to the captured list
             pass
 
-    # show thumbnails / list with remove option
     if st.session_state.camera_batch:
         st.write(f"Batch contains {len(st.session_state.camera_batch)} captures:")
         thumbs = st.session_state.camera_batch
@@ -197,10 +288,8 @@ elif mode == "📸 Continuous camera capture":
                 if st.button(f"Remove #{i+1}", key=f"rm_{i}"):
                     st.session_state.camera_batch.pop(i)
                     st.experimental_rerun()
-        # when processing, build uploaded_files from session_state
         uploaded_files = []
         for t in st.session_state.camera_batch:
-            # create an UploadedFile-like object with read() & name attr used later
             class _SimpleFile:
                 def __init__(self, name, b):
                     self.name = name
@@ -245,22 +334,18 @@ if uploaded_files:
             "cc_area_thresh": cc_area_thresh
         }
 
-        # Try calling detect_bubbles_and_answers with params if supported, else without params
         extracted = None
         base_overlay = None
         try:
-            # prefer signature with params if available
             sig = inspect.signature(detect_bubbles_and_answers)
             if "params" in sig.parameters:
                 extracted, base_overlay = detect_bubbles_and_answers(warped, debug=debug_mode, params=params)
             else:
                 extracted, base_overlay = detect_bubbles_and_answers(warped, debug=debug_mode)
         except TypeError:
-            # fallback to no-params call
             extracted, base_overlay = detect_bubbles_and_answers(warped, debug=debug_mode)
         except Exception as e:
             st.error(f"Detection error: {e}")
-            # show fallback overlay if available
             if base_overlay is not None:
                 buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); st.image(buf.getvalue(), use_column_width=True)
             continue
@@ -271,18 +356,17 @@ if uploaded_files:
                 buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); st.image(buf.getvalue(), use_column_width=True)
             continue
 
-        # Score answers
         scores = score_answers(extracted, key)
         all_scores.append((display_name, scores))
 
-        st.write(f"✅ Total: {scores['total']} / 100")
-        for i, val in enumerate(scores['per_subject']):
+        st.write(f"✅ Total: {scores.get('total',0)} / 100")
+        for i, val in enumerate(scores.get('per_subject', [])):
             st.write(f"Subject {i+1}: {val}/20")
 
-        # Annotate and show overlay
         annotated = annotate_overlay_with_scores(warped, scores, show_correct=show_correct, debug=debug_mode, offset_x=off_x, offset_y=off_y)
         buf = io.BytesIO()
         annotated.save(buf, format="PNG")
+        # fixed param name
         st.image(buf.getvalue(), caption=f"Detected Marks for {display_name}", use_column_width=True)
 
     # Export all results into one CSV
@@ -291,7 +375,7 @@ if uploaded_files:
         w = csv.writer(output)
         w.writerow(["file","question","chosen","correct","confidence","is_correct","ambiguous"])
         for fname, scores in all_scores:
-            for q, d in sorted(scores["details"].items(), key=lambda x:int(x[0])):
+            for q, d in sorted(scores.get("details", {}).items(), key=lambda x:int(x[0]) if str(x[0]).isdigit() else x[0]):
                 w.writerow([
                     fname,
                     q,
@@ -304,4 +388,4 @@ if uploaded_files:
         return output.getvalue().encode("utf-8")
 
     st.download_button("📥 Download All Results (CSV)", data=to_csv(all_scores),
-                    file_name="all_results.csv", mime="text/csv")
+                       file_name="all_results.csv", mime="text/csv")
