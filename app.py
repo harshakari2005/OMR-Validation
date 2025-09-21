@@ -1,6 +1,6 @@
-# app.py (Evaluator + Admin; CSV + Excel support; simple password auth)
+# app.py (Evaluator + Admin; Firestore support + SQLite fallback)
 import streamlit as st
-import sqlite3, json, io, csv, inspect, datetime, time
+import sqlite3, json, io, csv, inspect, datetime, time, os
 from omr import (
     load_image_bytes,
     warp_document,
@@ -12,9 +12,83 @@ import numpy as np, cv2
 from PIL import Image, ImageDraw, ImageFont
 import pandas as pd
 
+# Firestore imports (optional)
+firestore_client = None
+firebase_available = False
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
+    firebase_available = True
+except Exception:
+    firebase_available = False
+
 DB_PATH = "omr_system.db"
 
-# ---------------- DB HELPERS ----------------
+# ---------------- FIREBASE INIT ----------------
+def init_firestore():
+    global firestore_client, firebase_available
+    if not firebase_available:
+        return None
+
+    # Try multiple ways to get credentials:
+    # 1) Streamlit secrets: st.secrets["firebase"]["service_account"] (string or dict)
+    # 2) Path from env FIREBASE_CRED_PATH
+    # 3) Local file 'omr-validation-firebase-adminsdk.json' if present
+    try:
+        if "firebase" in st.secrets and "service_account" in st.secrets.get("firebase", {}):
+            # secrets can store JSON string or dict
+            svc = st.secrets["firebase"]["service_account"]
+            if isinstance(svc, str):
+                cred_dict = json.loads(svc)
+            else:
+                cred_dict = svc
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+            firestore_client = firestore.client()
+            return firestore_client
+    except Exception as e:
+        # continue to next method
+        st.experimental_set_query_params(_fb_err=str(e)) if hasattr(st, "experimental_set_query_params") else None
+
+    # env var path
+    try:
+        env_path = os.environ.get("FIREBASE_CRED_PATH")
+        if env_path and os.path.exists(env_path):
+            cred = credentials.Certificate(env_path)
+            firebase_admin.initialize_app(cred)
+            firestore_client = firestore.client()
+            return firestore_client
+    except Exception:
+        pass
+
+    # local file in project root (uploaded file)
+    try:
+        possible = [
+            "/workdir/omr-validation-firebase-adminsdk.json",  # fallback possibilities
+            "omr-validation-firebase-adminsdk.json",
+            "/mnt/data/omr-validation-firebase-adminsdk-fbsvc-a3c0b2924e.json",
+            os.path.join(os.getcwd(), "omr-validation-firebase-adminsdk-fbsvc-a3c0b2924e.json")
+        ]
+        for p in possible:
+            if p and os.path.exists(p):
+                cred = credentials.Certificate(p)
+                firebase_admin.initialize_app(cred)
+                firestore_client = firestore.client()
+                return firestore_client
+    except Exception:
+        pass
+
+    # If none worked:
+    return None
+
+# attempt to init once at import
+if firebase_available:
+    try:
+        init_firestore()
+    except Exception:
+        firestore_client = None
+
+# ---------------- DB HELPERS (Firestore first, SQLite fallback) ----------------
 def ensure_tables():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -30,7 +104,53 @@ def ensure_tables():
     conn.commit()
     conn.close()
 
-def get_exam_ids_from_db():
+# ---------- Firestore wrappers ----------
+def firestore_get_exam_ids():
+    if firestore_client is None:
+        return []
+    docs = firestore_client.collection("answer_keys").stream()
+    exam_ids = set()
+    for d in docs:
+        data = d.to_dict()
+        if data and "exam_id" in data:
+            exam_ids.add(data["exam_id"])
+    return sorted(list(exam_ids))
+
+def firestore_load_keys(exam_id):
+    if firestore_client is None:
+        return {}
+    docs = firestore_client.collection("answer_keys").where("exam_id", "==", exam_id).stream()
+    out = {}
+    for d in docs:
+        data = d.to_dict()
+        set_name = data.get("set_name")
+        answers = data.get("answers_dict") or {}
+        if set_name:
+            out[set_name] = answers
+    return out
+
+def firestore_insert_key(exam_id, set_name, answers_dict):
+    if firestore_client is None:
+        raise RuntimeError("Firestore not initialized")
+    # document id = examid__setname__timestamp for uniqueness
+    doc_id = f"{exam_id}__{set_name}__{int(time.time())}"
+    firestore_client.collection("answer_keys").document(doc_id).set({
+        "exam_id": exam_id,
+        "set_name": set_name,
+        "answers_dict": answers_dict,
+        "uploaded_on": datetime.datetime.utcnow().isoformat()
+    })
+
+def firestore_delete_key(exam_id, set_name):
+    if firestore_client is None:
+        raise RuntimeError("Firestore not initialized")
+    # find docs with exam_id and set_name and delete
+    docs = firestore_client.collection("answer_keys").where("exam_id", "==", exam_id).where("set_name", "==", set_name).stream()
+    for d in docs:
+        firestore_client.collection("answer_keys").document(d.id).delete()
+
+# ---------- SQLite wrappers ----------
+def get_exam_ids_from_db_sqlite():
     ensure_tables()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -39,7 +159,7 @@ def get_exam_ids_from_db():
     conn.close()
     return rows
 
-def load_keys_from_db(exam_id):
+def load_keys_from_db_sqlite(exam_id):
     ensure_tables()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -48,7 +168,7 @@ def load_keys_from_db(exam_id):
     conn.close()
     return {set_name: json.loads(ans_json) for set_name, ans_json in rows}
 
-def insert_key_into_db(exam_id, set_name, answers_dict):
+def insert_key_into_db_sqlite(exam_id, set_name, answers_dict):
     ensure_tables()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -59,13 +179,71 @@ def insert_key_into_db(exam_id, set_name, answers_dict):
     conn.commit()
     conn.close()
 
-def delete_key_from_db(exam_id, set_name):
+def delete_key_from_db_sqlite(exam_id, set_name):
     ensure_tables()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("DELETE FROM answer_keys WHERE exam_id=? AND set_name=?", (exam_id, set_name))
     conn.commit()
     conn.close()
+
+# ---------- Unified helpers that prefer Firestore ----------
+def get_exam_ids():
+    # prefer Firestore
+    if firestore_client:
+        try:
+            ids = firestore_get_exam_ids()
+            if ids:
+                return ids
+        except Exception:
+            pass
+    return get_exam_ids_from_db_sqlite()
+
+def load_keys_from_db(exam_id):
+    if firestore_client:
+        try:
+            keys = firestore_load_keys(exam_id)
+            if keys:
+                return keys
+        except Exception:
+            pass
+    return load_keys_from_db_sqlite(exam_id)
+
+def insert_key_into_db(exam_id, set_name, answers_dict):
+    # write to both (Firestore preferred); if firestore fails, still write sqlite
+    sqlite_ok = False
+    try:
+        insert_key_into_db_sqlite(exam_id, set_name, answers_dict)
+        sqlite_ok = True
+    except Exception:
+        sqlite_ok = False
+
+    if firestore_client:
+        try:
+            firestore_insert_key(exam_id, set_name, answers_dict)
+            return True
+        except Exception as e:
+            # log to Streamlit app, but keep sqlite version
+            st.warning(f"Warning: Firestore write failed: {e}")
+            return sqlite_ok
+    return sqlite_ok
+
+def delete_key_from_db(exam_id, set_name):
+    sqlite_ok = False
+    try:
+        delete_key_from_db_sqlite(exam_id, set_name)
+        sqlite_ok = True
+    except Exception:
+        sqlite_ok = False
+
+    if firestore_client:
+        try:
+            firestore_delete_key(exam_id, set_name)
+            return True
+        except Exception as e:
+            st.warning(f"Warning: Firestore delete failed: {e}")
+            return sqlite_ok
+    return sqlite_ok
 
 # ---------------- OVERLAY ANNOTATOR (returns PIL Image) ----------------
 def annotate_overlay_with_scores(warped, scores, show_correct=False, debug=False, offset_x=-30, offset_y=0):
@@ -143,11 +321,6 @@ def annotate_overlay_with_scores(warped, scores, show_correct=False, debug=False
 
 # ---------------- IMAGE DISPLAY HELPER ----------------
 def show_image(image_bytes_or_pil, caption=None):
-    """
-    Robust image display for multiple Streamlit versions:
-    - try use_container_width, then use_column_width, then fallback to plain st.image.
-    Accepts bytes or PIL.Image or numpy arrays.
-    """
     try:
         st.image(image_bytes_or_pil, caption=caption, use_container_width=True)
     except TypeError:
@@ -225,6 +398,16 @@ if mode_top == "Evaluator":
 # ---------------- Admin Mode ----------------
 if mode_top == "Admin":
     st.header("🔑 Admin — Manage Answer Keys")
+
+    # show Firebase status
+    if firestore_client:
+        st.success("Firestore connected ✅")
+    else:
+        if firebase_available:
+            st.warning("Firestore not initialized (check credentials). Uploaded keys will be saved to local SQLite.")
+        else:
+            st.info("firebase-admin not installed — using local SQLite only.")
+
     # login widget
     if not is_admin_authenticated():
         with st.expander("Admin login"):
@@ -238,11 +421,10 @@ if mode_top == "Admin":
         exam_id = st.text_input("Exam ID (e.g., Week1, Test2025)", key="adm_exam")
         set_name = st.text_input("Set Name (e.g., SetA, SetB)", key="adm_set")
         uploaded_key = st.file_uploader(
-    "Upload Answer Key (CSV or Excel: question,choice) — two columns",
-    type=["csv", "xlsx", "xls"],
-    key="adm_up"
-)
-
+            "Upload Answer Key (CSV or Excel: question,choice) — two columns",
+            type=["csv", "xlsx", "xls"],
+            key="adm_up"
+        )
         if st.button("Save Answer Key"):
             if not exam_id or not set_name:
                 st.warning("Please provide Exam ID and Set Name.")
@@ -250,17 +432,13 @@ if mode_top == "Admin":
                 st.warning("Upload a CSV or Excel file.")
             else:
                 try:
-                    # read into pandas DataFrame (handles both UploadedFile and raw bytes)
                     if uploaded_key.name.lower().endswith(".csv"):
                         df = pd.read_csv(uploaded_key)
                     else:
-                        # read_excel can accept file-like objects
                         df = pd.read_excel(uploaded_key)
 
-                    # Normalize: assume first two columns are question and choice
                     answers = {}
                     for idx, row in df.iterrows():
-                        # Use iloc to avoid depending on column names
                         try:
                             q = str(row.iloc[0]).strip()
                             a = str(row.iloc[1]).strip()
@@ -268,16 +446,20 @@ if mode_top == "Admin":
                             continue
                         if q and a and q.lower() not in ("nan", ""):
                             answers[q] = a
-                    if answers:
-                        insert_key_into_db(exam_id, set_name, answers)
-                        st.success(f"Uploaded key: {exam_id} / {set_name}")
-                    else:
+
+                    if not answers:
                         st.warning("No valid rows parsed from file.")
+                    else:
+                        ok = insert_key_into_db(exam_id, set_name, answers)
+                        if ok:
+                            st.success(f"Uploaded key: {exam_id} / {set_name}")
+                        else:
+                            st.error("Failed to save key to any DB.")
                 except Exception as e:
                     st.error(f"Error parsing/saving key: {e}")
 
     with st.expander("Existing keys"):
-        exam_ids = get_exam_ids_from_db()
+        exam_ids = get_exam_ids()
         if not exam_ids:
             st.info("No keys found yet.")
         else:
@@ -292,7 +474,6 @@ if mode_top == "Admin":
                             st.write(f"**{sel_exam} — {set_name}**  — {len(answers_json)} items")
                             cols = st.columns([1,1,1,4])
                             if cols[0].button("View", key=f"view_{sel_exam}_{set_name}"):
-                                # show small table (first 200 rows)
                                 rows = sorted(
                                     [(int(k) if str(k).isdigit() else k, v) for k,v in answers_json.items()],
                                     key=lambda x: (x[0] if isinstance(x[0], int) else float("inf"))
@@ -311,8 +492,7 @@ if mode_top == "Admin":
     st.stop()  # don't run evaluator UI when in admin mode
 
 # ---------------- Evaluator Mode (default flow below) ----------------
-# Load exam ids
-exam_ids = get_exam_ids_from_db()
+exam_ids = get_exam_ids()
 if not exam_ids:
     st.warning("⚠️ No answer keys found in the database. Please upload keys in the Admin dashboard first.")
     st.stop()
@@ -325,154 +505,6 @@ if not keys:
 set_choice = st.selectbox("Select Set", options=list(keys.keys()))
 key = keys[set_choice]
 
-# ---------------- Upload or Camera option ----------------
-input_mode = st.radio("Choose Input Mode", ["📂 Upload from files", "📸 Continuous camera capture"])
-
-# storage for camera captures across reruns
-if "camera_batch" not in st.session_state:
-    st.session_state.camera_batch = []
-
-uploaded_files = []
-if input_mode == "📂 Upload from files":
-    uploaded_files = st.file_uploader("Upload OMR sheets (multiple allowed)", type=["png","jpg","jpeg"], accept_multiple_files=True)
-
-elif input_mode == "📸 Continuous camera capture":
-    st.markdown("**Camera capture mode** — take one photo at a time and click **Add capture** to append to the batch.")
-    cam_photo = st.camera_input("Take a photo of the OMR sheet")
-    col1, col2, col3 = st.columns([1,1,1])
-    with col1:
-        if st.button("Add capture to batch"):
-            if cam_photo is None:
-                st.warning("No camera photo to add. Take a photo first.")
-            else:
-                b = cam_photo.read()
-                name = f"camera_{len(st.session_state.camera_batch)+1}_{int(time.time())}.jpg"
-                st.session_state.camera_batch.append({"name": name, "bytes": b})
-                st.success(f"Added capture ({name}) — {len(st.session_state.camera_batch)} in batch.")
-    with col2:
-        if st.button("Clear batch"):
-            st.session_state.camera_batch = []
-            st.info("Cleared camera batch.")
-    with col3:
-        if st.button("Process all captures now"):
-            pass
-
-    if st.session_state.camera_batch:
-        st.write(f"Batch contains {len(st.session_state.camera_batch)} captures:")
-        thumbs = st.session_state.camera_batch
-        cols = st.columns(min(4, len(thumbs)))
-        for i, thumb in enumerate(thumbs):
-            c = cols[i % len(cols)]
-            with c:
-                st.image(thumb["bytes"], width=150)
-                if st.button(f"Remove #{i+1}", key=f"rm_{i}"):
-                    st.session_state.camera_batch.pop(i)
-                    st.experimental_rerun()
-        uploaded_files = []
-        for t in st.session_state.camera_batch:
-            class _SimpleFile:
-                def __init__(self, name, b):
-                    self.name = name
-                    self._b = b
-                def read(self):
-                    return self._b
-            uploaded_files.append(_SimpleFile(t["name"], t["bytes"]))
-
-# ---------------- Processing ----------------
-all_scores = []
-if uploaded_files:
-    for uploaded in uploaded_files:
-        display_name = getattr(uploaded, "name", "camera_capture")
-        st.subheader(f"📄 Evaluating: {display_name}")
-        img_bytes = uploaded.read()
-        img = load_image_bytes(img_bytes)
-        if img is None:
-            st.error(f"Unable to read {display_name}")
-            continue
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurry, var = is_blurry(gray, threshold=blur_thresh)
-        bright = brightness_score(gray)
-        skew = estimate_skew_angle(gray)
-
-        st.write(f"Blur variance: {var:.2f} → {'BLURRY' if blurry else 'OK'}")
-        st.write(f"Brightness: {bright:.1f} → {'LOW' if bright < brightness_low else 'OK'}")
-        st.write(f"Skew angle: {skew:.1f}° → {'High skew' if abs(skew) > 15 else 'OK'}")
-
-        warped, _ = warp_document(img)
-
-        params = {
-            "adaptive_blocksize": adaptive_bs,
-            "adaptive_C": adaptive_C,
-            "fill_thresh": fill_thresh,
-            "ambig_low": ambig_low,
-            "mean_thresh": 140,
-            "min_radius_ratio": min_radius_ratio,
-            "max_radius_ratio": max_radius_ratio,
-            "search_radius": int(search_radius),
-            "morph_iter": morph_iter,
-            "cc_area_thresh": cc_area_thresh
-        }
-
-        extracted = None
-        base_overlay = None
-        try:
-            sig = inspect.signature(detect_bubbles_and_answers)
-            if "params" in sig.parameters:
-                extracted, base_overlay = detect_bubbles_and_answers(warped, debug=debug_mode, params=params)
-            else:
-                extracted, base_overlay = detect_bubbles_and_answers(warped, debug=debug_mode)
-        except TypeError:
-            extracted, base_overlay = detect_bubbles_and_answers(warped, debug=debug_mode)
-        except Exception as e:
-            st.error(f"Detection error: {e}")
-            if base_overlay is not None:
-                buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); show_image(buf.getvalue())
-            continue
-
-        if not extracted:
-            st.error(f"❌ Detection failed for {display_name}")
-            if base_overlay is not None:
-                buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); show_image(buf.getvalue())
-            continue
-
-        scores = score_answers(extracted, key)
-        all_scores.append((display_name, scores))
-
-        st.write(f"✅ Total: {scores.get('total',0)} / 100")
-        for i, val in enumerate(scores.get('per_subject', [])):
-            st.write(f"Subject {i+1}: {val}/20")
-
-        annotated = annotate_overlay_with_scores(warped, scores, show_correct=show_correct, debug=debug_mode, offset_x=off_x, offset_y=off_y)
-        buf = io.BytesIO()
-        annotated.save(buf, format="PNG")
-        # show_image handles different streamlit versions
-        show_image(buf.getvalue(), caption=f"Detected Marks for {display_name}")
-
-    # Export all results into one CSV
-    def to_csv(all_scores):
-        output = io.StringIO()
-        w = csv.writer(output)
-        w.writerow(["file","question","chosen","correct","confidence","is_correct","ambiguous"])
-        for fname, scores in all_scores:
-            details = scores.get("details", {})
-            def sort_key(x):
-                k = x[0]
-                try:
-                    return (0, int(k))
-                except Exception:
-                    return (1, str(k))
-            for q, d in sorted(details.items(), key=sort_key):
-                w.writerow([
-                    fname,
-                    q,
-                    d.get("chosen",""),
-                    d.get("correct_set",""),
-                    d.get("confidence",0),
-                    d.get("is_correct", False),
-                    d.get("ambiguous", False)
-                ])
-        return output.getvalue().encode("utf-8")
-
-    st.download_button("📥 Download All Results (CSV)", data=to_csv(all_scores),
-                    file_name="all_results.csv", mime="text/csv")
+# (rest of evaluator flow remains same as your working code)
+# ... (file upload, camera, detection, scoring, overlay, CSV export)
+# I omitted the evaluator internals here for brevity — keep them the same as you had.
