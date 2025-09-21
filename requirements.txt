@@ -1,15 +1,8 @@
-# core
 streamlit==1.24.0
-
-# computer vision - use headless opencv (compatible)
 opencv-python-headless==4.8.1.78
-
-# allow pip to pick a compatible numpy for the runtime (don't pin 1.26.0)
-numpy>=1.25.0
-
-# pillow must be < 10 to satisfy streamlit 1.24.0
-Pillow>=9.5.0,<10
-
-# other libs your project needs (examples)
-pandas>=1.5
-scikit-learn>=1.2
+numpy==2.1.2
+Pillow==9.4.0
+scikit-image==0.22.0
+scipy==1.13.1
+pandas==2.2.2
+matplotlib==3.9.2
