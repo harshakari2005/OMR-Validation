@@ -32,6 +32,7 @@ def get_exam_ids_from_db():
     conn.close()
     return rows
 
+
 def load_keys_from_db(exam_id):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -157,6 +158,8 @@ mode = st.radio("Choose Input Mode", ["📂 Upload from files", "📸 Continuous
 # storage for camera captures across reruns
 if "camera_batch" not in st.session_state:
     st.session_state.camera_batch = []  # list of dicts {name, bytes}
+if "process_now" not in st.session_state:
+    st.session_state.process_now = False
 
 uploaded_files = []
 if mode == "📂 Upload from files":
@@ -182,8 +185,8 @@ elif mode == "📸 Continuous camera capture":
             st.info("Cleared camera batch.")
     with col3:
         if st.button("Process all captures now"):
-            # we'll just fall through to processing code below; set uploaded_files to the captured list
-            pass
+            # trigger processing below
+            st.session_state.process_now = True
 
     # show thumbnails / list with remove option
     if st.session_state.camera_batch:
@@ -197,17 +200,20 @@ elif mode == "📸 Continuous camera capture":
                 if st.button(f"Remove #{i+1}", key=f"rm_{i}"):
                     st.session_state.camera_batch.pop(i)
                     st.experimental_rerun()
-        # when processing, build uploaded_files from session_state
-        uploaded_files = []
-        for t in st.session_state.camera_batch:
-            # create an UploadedFile-like object with read() & name attr used later
-            class _SimpleFile:
-                def __init__(self, name, b):
-                    self.name = name
-                    self._b = b
-                def read(self):
-                    return self._b
-            uploaded_files.append(_SimpleFile(t["name"], t["bytes"]))
+        # when processing, build uploaded_files from session_state only if user pressed Process
+        if st.session_state.process_now:
+            uploaded_files = []
+            for t in st.session_state.camera_batch:
+                # create an UploadedFile-like object with read() & name attr used later
+                class _SimpleFile:
+                    def __init__(self, name, b):
+                        self.name = name
+                        self._b = b
+                    def read(self):
+                        return self._b
+                uploaded_files.append(_SimpleFile(t["name"], t["bytes"]))
+            # reset flag so we don't reprocess on every rerun automatically
+            st.session_state.process_now = False
 
 # ---------------- Processing ----------------
 all_scores = []
@@ -262,13 +268,19 @@ if uploaded_files:
             st.error(f"Detection error: {e}")
             # show fallback overlay if available
             if base_overlay is not None:
-                buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); st.image(buf.getvalue(), use_container_width=True)
+                try:
+                    buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); st.image(buf.getvalue(), use_container_width=True)
+                except Exception:
+                    pass
             continue
 
         if not extracted:
             st.error(f"❌ Detection failed for {display_name}")
             if base_overlay is not None:
-                buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); st.image(buf.getvalue(), use_container_width=True)
+                try:
+                    buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); st.image(buf.getvalue(), use_container_width=True)
+                except Exception:
+                    pass
             continue
 
         # Score answers
@@ -279,11 +291,34 @@ if uploaded_files:
         for i, val in enumerate(scores['per_subject']):
             st.write(f"Subject {i+1}: {val}/20")
 
-        # Annotate and show overlay
+        # Annotate and show overlay (robust handling)
         annotated = annotate_overlay_with_scores(warped, scores, show_correct=show_correct, debug=debug_mode, offset_x=off_x, offset_y=off_y)
-        buf = io.BytesIO()
-        annotated.save(buf, format="PNG")
-        st.image(buf.getvalue(), caption=f"Detected Marks for {display_name}", use_container_width=True)
+        try:
+            # accept PIL Image, numpy arrays, or OpenCV images
+            if annotated is None:
+                raise RuntimeError("annotated image is None")
+            if isinstance(annotated, np.ndarray):
+                # if BGR (OpenCV) convert to RGB
+                if annotated.ndim == 3 and annotated.shape[2] == 3:
+                    annotated_pil = Image.fromarray(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+                else:
+                    annotated_pil = Image.fromarray(annotated)
+            elif isinstance(annotated, Image.Image):
+                annotated_pil = annotated
+            else:
+                # last resort: try to convert
+                annotated_pil = Image.fromarray(np.array(annotated))
+
+            buf = io.BytesIO()
+            annotated_pil.save(buf, format="PNG")
+            buf.seek(0)
+            img_bytes = buf.read()
+            if not img_bytes:
+                raise RuntimeError("Annotated image buffer is empty")
+            st.image(img_bytes, caption=f"Detected Marks for {display_name}", use_container_width=True)
+        except Exception as e:
+            st.error("Failed to render annotated image — see logs for details.")
+            st.exception(e)
 
     # Export all results into one CSV
     def to_csv(all_scores):
@@ -304,4 +339,4 @@ if uploaded_files:
         return output.getvalue().encode("utf-8")
 
     st.download_button("📥 Download All Results (CSV)", data=to_csv(all_scores),
-                       file_name="all_results.csv", mime="text/csv")
+                    file_name="all_results.csv", mime="text/csv")
