@@ -23,6 +23,7 @@ import inspect
 import datetime
 import time
 import os
+import traceback
 
 import numpy as np
 import cv2
@@ -220,7 +221,6 @@ def firestore_delete_key(exam_id, set_name):
 
 # ---------------- Unified DB helpers (prefer Firestore when available) ----------------
 def get_exam_ids():
-    # prefer Firestore
     if firestore_client:
         try:
             ids = firestore_get_exam_ids()
@@ -350,7 +350,6 @@ def annotate_overlay_with_scores(warped, scores, show_correct=False, debug=False
 
 # ---------------- Image display helper ----------------
 def show_image(img_or_bytes, caption=None):
-    """Show image robustly across Streamlit versions (use_container_width / use_column_width)."""
     try:
         st.image(img_or_bytes, caption=caption, use_container_width=True)
     except TypeError:
@@ -429,20 +428,17 @@ if mode_top == "Evaluator":
 # ---------------- Admin UI ----------------
 if mode_top == "Admin":
     st.header("🔑 Admin — Manage Answer Keys")
-    # Authentication
     if not is_admin_authenticated():
         with st.expander("Admin login"):
             admin_login_widget()
         st.stop()
 
-    # Authenticated
     st.subheader("Upload new answer key")
     ensure_tables()
 
     exam_id = st.text_input("Exam ID (e.g., Week1, Test2025)", key="adm_exam")
     set_name = st.text_input("Set Name (e.g., SetA, SetB)", key="adm_set")
 
-    # Accept CSV and Excel if pandas is available; otherwise only CSV
     allowed_types = ["csv"]
     if pd is not None:
         allowed_types = ["csv", "xlsx", "xls"]
@@ -460,50 +456,65 @@ if mode_top == "Admin":
             st.warning("Upload a CSV or Excel file.")
         else:
             try:
-                # CSV path
+                # parse file into a dataframe
                 if uploaded_key.name.lower().endswith(".csv"):
-                    text = None
-                    # UploadedFile from streamlit may provide getvalue()
-                    if hasattr(uploaded_key, "getvalue"):
-                        text = uploaded_key.getvalue().decode("utf-8")
-                        df = pd.read_csv(io.StringIO(text)) if pd is not None else None
+                    if pd is not None:
+                        if hasattr(uploaded_key, "getvalue"):
+                            text = uploaded_key.getvalue().decode("utf-8")
+                            df = pd.read_csv(io.StringIO(text))
+                        else:
+                            df = pd.read_csv(uploaded_key)
                     else:
-                        df = pd.read_csv(uploaded_key) if pd is not None else None
+                        # pandas not available but CSV can be read manually
+                        text = uploaded_key.getvalue().decode("utf-8") if hasattr(uploaded_key, "getvalue") else uploaded_key.read().decode("utf-8")
+                        reader = csv.reader(io.StringIO(text))
+                        answers = {}
+                        for row in reader:
+                            if not row: continue
+                            q = str(row[0]).strip()
+                            a = str(row[1]).strip() if len(row) > 1 else ""
+                            if q and a:
+                                answers[q] = a
+                        if answers:
+                            ok = insert_key_into_db(exam_id, set_name, answers)
+                            if ok:
+                                st.success(f"✅ Uploaded key: {exam_id} / {set_name}")
+                            else:
+                                st.error("Failed to save key (both Firestore and SQLite failed).")
+                            df = None
+                        else:
+                            st.warning("No valid rows parsed from CSV.")
+                            df = None
                 else:
                     if pd is None:
                         st.error("Pandas is not installed on the server — cannot parse Excel. Install pandas.")
                         df = None
                     else:
-                        # read_excel will accept the UploadedFile object
                         df = pd.read_excel(uploaded_key)
 
-                if df is None:
-                    raise RuntimeError("Failed to parse the file. Ensure pandas is installed for Excel support.")
-
-                # Normalize: use first two columns
-                answers = {}
-                for _, row in df.iterrows():
-                    try:
-                        q = str(row.iloc[0]).strip()
-                        a = str(row.iloc[1]).strip()
-                    except Exception:
-                        continue
-                    if q and a and q.lower() not in ("nan", ""):
-                        answers[q] = a
-                if answers:
-                    ok = insert_key_into_db(exam_id, set_name, answers)
-                    if ok:
-                        st.success(f"✅ Uploaded key: {exam_id} / {set_name}")
+                if df is not None:
+                    answers = {}
+                    for _, row in df.iterrows():
+                        try:
+                            q = str(row.iloc[0]).strip()
+                            a = str(row.iloc[1]).strip()
+                        except Exception:
+                            continue
+                        if q and a and q.lower() not in ("nan", ""):
+                            answers[q] = a
+                    if answers:
+                        ok = insert_key_into_db(exam_id, set_name, answers)
+                        if ok:
+                            st.success(f"✅ Uploaded key: {exam_id} / {set_name}")
+                        else:
+                            st.error("Failed to save key (both Firestore and SQLite failed).")
                     else:
-                        st.error("Failed to save key (both Firestore and SQLite failed).")
-                else:
-                    st.warning("No valid rows parsed from the file.")
+                        st.warning("No valid rows parsed from the file.")
             except Exception as e:
-                st.error(f"Error parsing/saving key: {e}")
+                st.error(f"Error parsing/saving key: {e}\n{traceback.format_exc()}")
 
     st.markdown("---")
     st.subheader("Existing keys")
-    # Show from sqlite for admin convenience (Firestore may also be used)
     exam_ids_sql = get_exam_ids_from_db_sqlite()
     if not exam_ids_sql:
         st.info("No keys found in SQLite. (If you are using Firestore, keys may be stored there instead.)")
@@ -651,7 +662,7 @@ if uploaded_files:
         except TypeError:
             extracted, base_overlay = detect_bubbles_and_answers(warped, debug=debug_mode)
         except Exception as e:
-            st.error(f"Detection error: {e}")
+            st.error(f"Detection error: {e}\n{traceback.format_exc()}")
             if base_overlay is not None:
                 buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); show_image(buf.getvalue())
             continue
@@ -700,6 +711,6 @@ if uploaded_files:
         return output.getvalue().encode("utf-8")
 
     st.download_button("📥 Download All Results (CSV)", data=to_csv(all_scores),
-                    file_name="all_results.csv", mime="text/csv")
+                      file_name="all_results.csv", mime="text/csv")
 else:
     st.info("Upload OMR sheet files (or switch to camera mode) to start evaluation.")
