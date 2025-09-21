@@ -1,4 +1,4 @@
-# app.py (Evaluator + Admin with simple password auth)
+# app.py (Evaluator + Admin; CSV + Excel support; simple password auth)
 import streamlit as st
 import sqlite3, json, io, csv, inspect, datetime, time
 from omr import (
@@ -10,6 +10,7 @@ from omr import (
 from utils import is_blurry, brightness_score, estimate_skew_angle
 import numpy as np, cv2
 from PIL import Image, ImageDraw, ImageFont
+import pandas as pd
 
 DB_PATH = "omr_system.db"
 
@@ -66,7 +67,7 @@ def delete_key_from_db(exam_id, set_name):
     conn.commit()
     conn.close()
 
-# ---------------- OVERLAY ANNOTATOR (unchanged, returns PIL Image) ----------------
+# ---------------- OVERLAY ANNOTATOR (returns PIL Image) ----------------
 def annotate_overlay_with_scores(warped, scores, show_correct=False, debug=False, offset_x=-30, offset_y=0):
     overlay = Image.fromarray(cv2.cvtColor(warped, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(overlay)
@@ -140,21 +141,33 @@ def annotate_overlay_with_scores(warped, scores, show_correct=False, debug=False
 
     return overlay
 
+# ---------------- IMAGE DISPLAY HELPER ----------------
+def show_image(image_bytes_or_pil, caption=None):
+    """
+    Robust image display for multiple Streamlit versions:
+    - try use_container_width, then use_column_width, then fallback to plain st.image.
+    Accepts bytes or PIL.Image or numpy arrays.
+    """
+    try:
+        st.image(image_bytes_or_pil, caption=caption, use_container_width=True)
+    except TypeError:
+        try:
+            st.image(image_bytes_or_pil, caption=caption, use_column_width=True)
+        except TypeError:
+            st.image(image_bytes_or_pil, caption=caption)
+
 # ---------------- AUTH HELPERS ----------------
 def is_admin_authenticated():
-    """Return True if session is already authenticated as admin."""
     return st.session_state.get("admin_authenticated", False)
 
 def admin_login_widget():
-    """Render login widget & set session state on success."""
     if "admin_authenticated" not in st.session_state:
         st.session_state.admin_authenticated = False
 
-    # If secrets not set, show instructions
     try:
         admin_pw = st.secrets["auth"]["admin_password"]
     except Exception:
-        st.warning("Admin password not configured. On Streamlit Cloud, set `auth.admin_password` in Secrets (App → Settings → Secrets).")
+        st.warning("Admin password not configured in Secrets. On Streamlit Cloud set `auth.admin_password`.")
         admin_pw = None
 
     if is_admin_authenticated():
@@ -189,7 +202,7 @@ st.title("OMR — Evaluator & Admin Dashboard")
 # top-level mode selector
 mode_top = st.sidebar.radio("App Mode", ["Evaluator", "Admin"])
 
-# Common sliders for evaluator placed in sidebar (only used in Evaluator mode)
+# Common sliders for evaluator (only when in Evaluator mode)
 if mode_top == "Evaluator":
     st.sidebar.header("Detection tuning")
     blur_thresh = st.sidebar.slider('Blur threshold', 10, 300, 100)
@@ -224,36 +237,42 @@ if mode_top == "Admin":
     with st.expander("Upload new answer key"):
         exam_id = st.text_input("Exam ID (e.g., Week1, Test2025)", key="adm_exam")
         set_name = st.text_input("Set Name (e.g., SetA, SetB)", key="adm_set")
-        uploaded_key = st.file_uploader("Upload Answer Key (CSV: question,choice) — two columns", type=["csv"], key="adm_up")
+        uploaded_key = st.file_uploader(
+    "Upload Answer Key (CSV or Excel: question,choice) — two columns",
+    type=["csv", "xlsx", "xls"],
+    key="adm_up"
+)
+
         if st.button("Save Answer Key"):
             if not exam_id or not set_name:
                 st.warning("Please provide Exam ID and Set Name.")
             elif uploaded_key is None:
-                st.warning("Upload a CSV file.")
+                st.warning("Upload a CSV or Excel file.")
             else:
                 try:
-                    # UploadedFile may have getvalue() or read(); handle both
-                    raw = None
-                    if hasattr(uploaded_key, "getvalue"):
-                        raw = uploaded_key.getvalue()
+                    # read into pandas DataFrame (handles both UploadedFile and raw bytes)
+                    if uploaded_key.name.lower().endswith(".csv"):
+                        df = pd.read_csv(uploaded_key)
                     else:
-                        raw = uploaded_key.read()
-                    text = raw.decode("utf-8")
-                    reader = csv.reader(io.StringIO(text))
+                        # read_excel can accept file-like objects
+                        df = pd.read_excel(uploaded_key)
+
+                    # Normalize: assume first two columns are question and choice
                     answers = {}
-                    for row in reader:
-                        if not row: continue
-                        q = str(row[0]).strip()
-                        if len(row) < 2:
-                            st.warning(f"Skipping row {row} — missing answer column.")
+                    for idx, row in df.iterrows():
+                        # Use iloc to avoid depending on column names
+                        try:
+                            q = str(row.iloc[0]).strip()
+                            a = str(row.iloc[1]).strip()
+                        except Exception:
                             continue
-                        a = str(row[1]).strip()
-                        answers[q] = a
+                        if q and a and q.lower() not in ("nan", ""):
+                            answers[q] = a
                     if answers:
                         insert_key_into_db(exam_id, set_name, answers)
                         st.success(f"Uploaded key: {exam_id} / {set_name}")
                     else:
-                        st.warning("No valid rows parsed from CSV.")
+                        st.warning("No valid rows parsed from file.")
                 except Exception as e:
                     st.error(f"Error parsing/saving key: {e}")
 
@@ -408,13 +427,13 @@ if uploaded_files:
         except Exception as e:
             st.error(f"Detection error: {e}")
             if base_overlay is not None:
-                buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); st.image(buf.getvalue(), use_column_width=True)
+                buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); show_image(buf.getvalue())
             continue
 
         if not extracted:
             st.error(f"❌ Detection failed for {display_name}")
             if base_overlay is not None:
-                buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); st.image(buf.getvalue(), use_column_width=True)
+                buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); show_image(buf.getvalue())
             continue
 
         scores = score_answers(extracted, key)
@@ -427,8 +446,8 @@ if uploaded_files:
         annotated = annotate_overlay_with_scores(warped, scores, show_correct=show_correct, debug=debug_mode, offset_x=off_x, offset_y=off_y)
         buf = io.BytesIO()
         annotated.save(buf, format="PNG")
-        # fixed param name that matches older Streamlit versions used in logs
-        st.image(buf.getvalue(), caption=f"Detected Marks for {display_name}", use_column_width=True)
+        # show_image handles different streamlit versions
+        show_image(buf.getvalue(), caption=f"Detected Marks for {display_name}")
 
     # Export all results into one CSV
     def to_csv(all_scores):
@@ -437,7 +456,6 @@ if uploaded_files:
         w.writerow(["file","question","chosen","correct","confidence","is_correct","ambiguous"])
         for fname, scores in all_scores:
             details = scores.get("details", {})
-            # safe sort: numeric keys first
             def sort_key(x):
                 k = x[0]
                 try:
@@ -457,4 +475,4 @@ if uploaded_files:
         return output.getvalue().encode("utf-8")
 
     st.download_button("📥 Download All Results (CSV)", data=to_csv(all_scores),
-                       file_name="all_results.csv", mime="text/csv")
+                    file_name="all_results.csv", mime="text/csv")
