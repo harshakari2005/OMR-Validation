@@ -1,11 +1,10 @@
 # app.py — Full updated evaluator + admin app with Firestore support (preferred) and SQLite fallback
-# Supports CSV and Excel uploads for answer keys, simple admin password auth,
-# camera + file upload evaluator, overlay annotation and CSV export.
+# Added: feedback generator per-student + optional Firestore save of feedback
 #
 # NOTE: This file assumes you have a local `omr` package with:
 #   load_image_bytes, warp_document, detect_bubbles_and_answers, score_answers
 # and a `utils` module with: is_blurry, brightness_score, estimate_skew_angle
-# Also optional: firebase-admin installed + valid credentials passed via st.secrets or env/file.
+# Optional: pandas for Excel support, firebase-admin for Firestore.
 # If you deploy to Streamlit Cloud, put admin password in Secrets as:
 # [auth]
 # admin_password = "yourpassword"
@@ -23,7 +22,6 @@ import inspect
 import datetime
 import time
 import os
-import traceback
 
 import numpy as np
 import cv2
@@ -221,6 +219,7 @@ def firestore_delete_key(exam_id, set_name):
 
 # ---------------- Unified DB helpers (prefer Firestore when available) ----------------
 def get_exam_ids():
+    # prefer Firestore
     if firestore_client:
         try:
             ids = firestore_get_exam_ids()
@@ -273,6 +272,128 @@ def delete_key_from_db(exam_id, set_name):
             st.warning(f"Warning: Firestore delete failed: {e}")
             return sqlite_ok
     return sqlite_ok
+
+# ---------------- FEEDBACK HELPERS ----------------
+def grade_from_percent(pct: float):
+    if pct >= 90:
+        return "A+", "Excellent — outstanding performance"
+    if pct >= 80:
+        return "A", "Very good — strong understanding"
+    if pct >= 70:
+        return "B", "Good — a few areas to improve"
+    if pct >= 60:
+        return "C", "Satisfactory — consider revision on weaker topics"
+    if pct >= 50:
+        return "D", "Passing — but needs improvement"
+    return "F", "Failing — revision required"
+
+def generate_feedback(scores: dict, top_n_incorrect=8):
+    total = float(scores.get("total", 0))
+    pct = total
+    letter, remark = grade_from_percent(pct)
+    pass_fail = "PASS" if pct >= 50 else "FAIL"
+
+    details = scores.get("details", {}) or {}
+    incorrect = []
+    low_conf = []
+    for q, d in details.items():
+        is_corr = bool(d.get("is_correct", False))
+        if not is_corr:
+            try:
+                qnum = int(q) if str(q).isdigit() else q
+            except Exception:
+                qnum = q
+            incorrect.append((qnum, d))
+        conf = d.get("confidence", None)
+        if conf is not None and isinstance(conf, (int, float)) and conf < 0.35:
+            low_conf.append((q, conf))
+
+    def qkey(x):
+        k = x[0]
+        try:
+            return int(k)
+        except Exception:
+            return str(k)
+    incorrect_sorted = sorted(incorrect, key=qkey)
+
+    per_subject = scores.get("per_subject") or []
+    weak_subjects = []
+    for idx, s in enumerate(per_subject):
+        try:
+            sc = float(s)
+        except Exception:
+            sc = 0.0
+        if sc < 12:
+            weak_subjects.append((idx + 1, sc))
+
+    tips = []
+    if weak_subjects:
+        tips.append("Focus on weak subjects: " + ", ".join([f"Subject {i} ({v}/20)" for i, v in weak_subjects]))
+        tips.append("Revisit topic summaries and attempt practice questions for those areas.")
+    if incorrect_sorted:
+        sample_qs = incorrect_sorted[:top_n_incorrect]
+        tips.append("Review incorrect questions: " + ", ".join([str(x[0]) for x in sample_qs]))
+    if low_conf:
+        tips.append("Some answers had low confidence — ensure marking is clear and avoid smudges.")
+    if not tips:
+        tips.append("Great work — keep practicing to maintain mastery!")
+
+    feedback_lines = []
+    feedback_lines.append(f"Total score: {total:.1f} / 100 ({pct:.1f}%)")
+    feedback_lines.append(f"Grade: {letter} — {remark}")
+    feedback_lines.append(f"Result: {pass_fail}")
+    feedback_lines.append("")
+    if weak_subjects:
+        feedback_lines.append("Weak subjects:")
+        for i, v in weak_subjects:
+            feedback_lines.append(f"  - Subject {i}: {v}/20")
+        feedback_lines.append("")
+    if incorrect_sorted:
+        feedback_lines.append(f"Incorrect / flagged questions (showing up to {top_n_incorrect}):")
+        for q, d in incorrect_sorted[:top_n_incorrect]:
+            chosen = d.get("chosen", "")
+            correct_set = d.get("correct_set", "")
+            conf = d.get("confidence", "")
+            feedback_lines.append(f"  Q{q}: chosen={chosen} | correct={correct_set} | confidence={conf}")
+        feedback_lines.append("")
+    if low_conf:
+        feedback_lines.append("Low-confidence answers (confidence < 0.35):")
+        for q, c in low_conf:
+            feedback_lines.append(f"  Q{q}: confidence={c:.2f}")
+        feedback_lines.append("")
+    feedback_lines.append("Study tips:")
+    for t in tips:
+        feedback_lines.append(f"  - {t}")
+
+    return {
+        "percent": pct,
+        "grade": letter,
+        "remark": remark,
+        "pass_fail": pass_fail,
+        "weak_subjects": weak_subjects,
+        "incorrect": incorrect_sorted,
+        "low_conf": low_conf,
+        "tips": tips,
+        "text": "\n".join(feedback_lines)
+    }
+
+def save_feedback_to_firestore(feedback: dict, student_name: str, exam_id: str, set_name: str):
+    """Save feedback into Firestore collection 'feedbacks' if firestore_client available."""
+    if firestore_client is None:
+        return False
+    try:
+        doc_id = f"{exam_id}__{set_name}__{student_name}__{int(time.time())}"
+        firestore_client.collection("feedbacks").document(doc_id).set({
+            "student_name": student_name,
+            "exam_id": exam_id,
+            "set_name": set_name,
+            "feedback": feedback,
+            "saved_on": datetime.datetime.utcnow().isoformat()
+        })
+        return True
+    except Exception as e:
+        st.warning(f"Failed to save feedback to Firestore: {e}")
+        return False
 
 # ---------------- Annotator (returns PIL image) ----------------
 def annotate_overlay_with_scores(warped, scores, show_correct=False, debug=False, offset_x=-30, offset_y=0):
@@ -350,6 +471,7 @@ def annotate_overlay_with_scores(warped, scores, show_correct=False, debug=False
 
 # ---------------- Image display helper ----------------
 def show_image(img_or_bytes, caption=None):
+    """Show image robustly across Streamlit versions (use_container_width / use_column_width)."""
     try:
         st.image(img_or_bytes, caption=caption, use_container_width=True)
     except TypeError:
@@ -428,17 +550,20 @@ if mode_top == "Evaluator":
 # ---------------- Admin UI ----------------
 if mode_top == "Admin":
     st.header("🔑 Admin — Manage Answer Keys")
+    # Authentication
     if not is_admin_authenticated():
         with st.expander("Admin login"):
             admin_login_widget()
         st.stop()
 
+    # Authenticated
     st.subheader("Upload new answer key")
     ensure_tables()
 
     exam_id = st.text_input("Exam ID (e.g., Week1, Test2025)", key="adm_exam")
     set_name = st.text_input("Set Name (e.g., SetA, SetB)", key="adm_set")
 
+    # Accept CSV and Excel if pandas is available; otherwise only CSV
     allowed_types = ["csv"]
     if pd is not None:
         allowed_types = ["csv", "xlsx", "xls"]
@@ -456,35 +581,13 @@ if mode_top == "Admin":
             st.warning("Upload a CSV or Excel file.")
         else:
             try:
-                # parse file into a dataframe
                 if uploaded_key.name.lower().endswith(".csv"):
-                    if pd is not None:
-                        if hasattr(uploaded_key, "getvalue"):
-                            text = uploaded_key.getvalue().decode("utf-8")
-                            df = pd.read_csv(io.StringIO(text))
-                        else:
-                            df = pd.read_csv(uploaded_key)
+                    text = None
+                    if hasattr(uploaded_key, "getvalue"):
+                        text = uploaded_key.getvalue().decode("utf-8")
+                        df = pd.read_csv(io.StringIO(text)) if pd is not None else None
                     else:
-                        # pandas not available but CSV can be read manually
-                        text = uploaded_key.getvalue().decode("utf-8") if hasattr(uploaded_key, "getvalue") else uploaded_key.read().decode("utf-8")
-                        reader = csv.reader(io.StringIO(text))
-                        answers = {}
-                        for row in reader:
-                            if not row: continue
-                            q = str(row[0]).strip()
-                            a = str(row[1]).strip() if len(row) > 1 else ""
-                            if q and a:
-                                answers[q] = a
-                        if answers:
-                            ok = insert_key_into_db(exam_id, set_name, answers)
-                            if ok:
-                                st.success(f"✅ Uploaded key: {exam_id} / {set_name}")
-                            else:
-                                st.error("Failed to save key (both Firestore and SQLite failed).")
-                            df = None
-                        else:
-                            st.warning("No valid rows parsed from CSV.")
-                            df = None
+                        df = pd.read_csv(uploaded_key) if pd is not None else None
                 else:
                     if pd is None:
                         st.error("Pandas is not installed on the server — cannot parse Excel. Install pandas.")
@@ -492,26 +595,28 @@ if mode_top == "Admin":
                     else:
                         df = pd.read_excel(uploaded_key)
 
-                if df is not None:
-                    answers = {}
-                    for _, row in df.iterrows():
-                        try:
-                            q = str(row.iloc[0]).strip()
-                            a = str(row.iloc[1]).strip()
-                        except Exception:
-                            continue
-                        if q and a and q.lower() not in ("nan", ""):
-                            answers[q] = a
-                    if answers:
-                        ok = insert_key_into_db(exam_id, set_name, answers)
-                        if ok:
-                            st.success(f"✅ Uploaded key: {exam_id} / {set_name}")
-                        else:
-                            st.error("Failed to save key (both Firestore and SQLite failed).")
+                if df is None:
+                    raise RuntimeError("Failed to parse the file. Ensure pandas is installed for Excel support.")
+
+                answers = {}
+                for _, row in df.iterrows():
+                    try:
+                        q = str(row.iloc[0]).strip()
+                        a = str(row.iloc[1]).strip()
+                    except Exception:
+                        continue
+                    if q and a and q.lower() not in ("nan", ""):
+                        answers[q] = a
+                if answers:
+                    ok = insert_key_into_db(exam_id, set_name, answers)
+                    if ok:
+                        st.success(f"✅ Uploaded key: {exam_id} / {set_name}")
                     else:
-                        st.warning("No valid rows parsed from the file.")
+                        st.error("Failed to save key (both Firestore and SQLite failed).")
+                else:
+                    st.warning("No valid rows parsed from the file.")
             except Exception as e:
-                st.error(f"Error parsing/saving key: {e}\n{traceback.format_exc()}")
+                st.error(f"Error parsing/saving key: {e}")
 
     st.markdown("---")
     st.subheader("Existing keys")
@@ -627,6 +732,7 @@ if uploaded_files:
             st.error(f"Unable to read {display_name}")
             continue
 
+        # quality checks
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         blurry, var = is_blurry(gray, threshold=blur_thresh)
         bright = brightness_score(gray)
@@ -662,7 +768,7 @@ if uploaded_files:
         except TypeError:
             extracted, base_overlay = detect_bubbles_and_answers(warped, debug=debug_mode)
         except Exception as e:
-            st.error(f"Detection error: {e}\n{traceback.format_exc()}")
+            st.error(f"Detection error: {e}")
             if base_overlay is not None:
                 buf = io.BytesIO(); base_overlay.save(buf, format="PNG"); show_image(buf.getvalue())
             continue
@@ -676,10 +782,35 @@ if uploaded_files:
         scores = score_answers(extracted, key)
         all_scores.append((display_name, scores))
 
+        # Show summary
         st.write(f"✅ Total: {scores.get('total',0)} / 100")
         for i, val in enumerate(scores.get('per_subject', [])):
             st.write(f"Subject {i+1}: {val}/20")
 
+        # Generate feedback and show in an expander
+        fb = generate_feedback(scores)
+        with st.expander("🔎 Student feedback (click to expand)"):
+            st.markdown(f"**Score:** {fb['percent']:.1f}% — **Grade:** {fb['grade']} — **Result:** {fb['pass_fail']}")
+            st.markdown("**Quick tips:**")
+            for tip in fb['tips']:
+                st.write(f"- {tip}")
+            st.markdown("---")
+            st.text(fb['text'])
+
+            # Save to Firestore optionally
+            if firestore_client:
+                saved = save_feedback_to_firestore(fb, student_name=display_name, exam_id=exam_id, set_name=set_choice)
+                if saved:
+                    st.success("Saved feedback to Firestore.")
+                else:
+                    st.warning("Could not save feedback to Firestore.")
+
+            # Download feedback text
+            feedback_filename = f"feedback_{display_name.replace(' ', '_')}.txt"
+            st.download_button("📄 Download feedback (TXT)", data=fb['text'].encode('utf-8'),
+                               file_name=feedback_filename, mime="text/plain")
+
+        # Annotate and show overlay
         annotated = annotate_overlay_with_scores(warped, scores, show_correct=show_correct, debug=debug_mode, offset_x=off_x, offset_y=off_y)
         buf = io.BytesIO()
         annotated.save(buf, format="PNG")
@@ -711,6 +842,6 @@ if uploaded_files:
         return output.getvalue().encode("utf-8")
 
     st.download_button("📥 Download All Results (CSV)", data=to_csv(all_scores),
-                      file_name="all_results.csv", mime="text/csv")
+                    file_name="all_results.csv", mime="text/csv")
 else:
     st.info("Upload OMR sheet files (or switch to camera mode) to start evaluation.")
